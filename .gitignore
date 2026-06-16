@@ -1,0 +1,16 @@
+# 项目环境与缓存
+__pycache__/
+venv/
+.claude/
+CLAUDE.md
+.playwright-mcp/
+
+# Python编译文件
+*.pyc
+*.pyo
+*.pyd
+
+# 日志&临时文件
+*.log
+*.tmp
+.DS_Store
