@@ -1,5 +1,5 @@
 # ============================================
-# message_format.py - 完整版本
+# message_format.py
 # ============================================
 
 from enum import Enum
@@ -169,4 +169,54 @@ def create_response(success: bool, message: str, data: Dict = None) -> Dict:
         "message": message,
         "data": data or {},
         "timestamp": __import__('time').time()
+    }
+
+
+
+def create_bind_message(user_id: str, device_id: str) -> dict:
+    """创建设备绑定消息"""
+    import time
+    return {
+        "type": "bind_device",
+        "user_id": user_id,
+        "params": {"device_id": device_id},
+        "reply_topic": "user/response",
+        "timestamp": time.time()
+    }
+
+def create_unbind_message(user_id: str, device_id: str) -> dict:
+    """创建设备解绑消息"""
+    import time
+    return {
+        "type": "unbind_device",
+        "user_id": user_id,
+        "params": {"device_id": device_id},
+        "reply_topic": "user/response",
+        "timestamp": time.time()
+    }
+
+def create_control_message(user_id: str, device_id: str, command: str, params: dict = None) -> dict:
+    """创建设备控制消息"""
+    import time
+    return {
+        "type": "control_device",
+        "user_id": user_id,
+        "params": {
+            "device_id": device_id,
+            "command": command,
+            "params": params or {}
+        },
+        "reply_topic": "user/response",
+        "timestamp": time.time()
+    }
+
+def create_get_status_message(user_id: str, device_id: str = None) -> dict:
+    """创建设备状态查询消息"""
+    import time
+    return {
+        "type": "get_status",
+        "user_id": user_id,
+        "params": {"device_id": device_id} if device_id else {},
+        "reply_topic": "user/response",
+        "timestamp": time.time()
     }

@@ -1,195 +1,146 @@
 # ============================================
-# devices/air_conditioner.py - 完整修复版
+# devices/air_conditioner.py
 # ============================================
 
 import json
 import time
-import threading
-import secrets
-from typing import Dict, Any
-
-import paho.mqtt.client as mqtt
-
-# 添加父目录到路径
 import sys
 import os
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import BROKER_HOST, BROKER_PORT, TOPICS, SECRET_KEY, DEVICE_IDS
-from crypto_utils import CryptoUtils, check_timestamp, check_seq_num
+import paho.mqtt.client as mqtt
+from config import BROKER_HOST, BROKER_PORT, TOPICS, SECRET_KEY
+from crypto_utils import CryptoUtils
 
 
 class AirConditioner:
-    """智能空调设备"""
-
     def __init__(self, device_id: str, secret_key: bytes):
         self.device_id = device_id
         self.secret_key = secret_key
 
         # 设备状态
-        self.is_on = False
-        self.temperature = 24  # 摄氏度
-        self.mode = "cool"  # cool, heat, fan, auto
-        self.fan_speed = "auto"  # auto, low, medium, high
-        self.target_temperature = 24
+        self.power = "off"
+        self.temperature = 24
+        self.mode = "cool"
+        self.fan_speed = "auto"
 
-        # MQTT 客户端
-        self.mqtt_client = mqtt.Client()
+        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.seq_num = 0
+        self.running = True
+
         self.setup_mqtt_callbacks()
 
-        # 状态更新线程
-        self.running = True
-        self.status_thread = threading.Thread(target=self._periodic_status_update, daemon=True)
-
     def setup_mqtt_callbacks(self):
-        """设置MQTT回调"""
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
 
-    def on_connect(self, client, userdata, flags, rc):
-        """连接成功回调"""
+    def on_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
+            print(f"\n{'=' * 50}")
             print(f"[空调] ✅ 已连接到MQTT Broker")
             # 订阅命令主题
             command_topic = f"device/{self.device_id}/command"
             self.mqtt_client.subscribe(command_topic)
             print(f"[空调] 已订阅: {command_topic}")
+            print(f"{'=' * 50}\n")
 
-            # 发送注册消息
+            # 注册设备
             self.register_device()
+
+            # 延迟后上报初始状态
+            time.sleep(1)
+            self.send_status()
         else:
-            print(f"[空调] ❌ 连接失败，错误码: {rc}")
+            print(f"[空调] ❌ 连接失败, 错误码: {rc}")
 
     def register_device(self):
-        """设备注册"""
         register_msg = {
             "device_id": self.device_id,
             "device_type": "air_conditioner",
             "mac": f"AC_{self.device_id[-6:]}",
-            "product_key": "ac_product_001",
-            "firmware_version": "1.0.0"
+            "product_key": "ac_product_001"
         }
-
         self.mqtt_client.publish(TOPICS["device_register"], json.dumps(register_msg))
-        print(f"[空调] 📱 发送注册请求: {self.device_id}")
-
-        # 订阅注册响应
-        response_topic = f"device/{self.device_id}/register_response"
-        self.mqtt_client.subscribe(response_topic)
+        print(f"[空调] 📱 发送注册请求")
 
     def on_message(self, client, userdata, msg):
-        """处理接收到的消息"""
+        """处理接收到的命令"""
         try:
             payload = json.loads(msg.payload.decode())
+            print(f"\n[空调] 📨 收到消息: {json.dumps(payload, ensure_ascii=False)}")
+
+            # 解析命令（支持多种格式）
+            command = None
+            params = {}
 
             if "command" in payload:
-                self.handle_command(payload)
-            elif "response" in msg.topic:
-                self.handle_response(payload)
+                command = payload["command"]
+                params = payload.get("params", {})
+            elif "params" in payload and isinstance(payload["params"], dict):
+                if "command" in payload["params"]:
+                    command = payload["params"]["command"]
+                    params = payload["params"].get("params", {})
 
-        except json.JSONDecodeError:
-            print(f"[空调] ❌ JSON解析失败: {msg.payload}")
+            if command:
+                self.execute_command(command, params)
+            else:
+                print(f"[空调] ⚠️ 未识别到命令")
+
         except Exception as e:
-            print(f"[空调] ❌ 处理消息异常: {e}")
+            print(f"[空调] ❌ 处理异常: {e}")
 
-    def handle_command(self, payload: Dict):
-        """处理控制命令"""
-        command = payload.get("command")
-        params = payload.get("params", {})
+    def execute_command(self, command, params):
+        """执行命令并立即上报状态"""
+        print(f"\n[空调] 🎮 执行: {command} {params}")
 
-        print(f"[空调] 🎮 收到命令: {command} {params}")
+        changed = False
 
-        result = False
         if command == "on":
-            result = self.turn_on()
+            self.power = "on"
+            changed = True
+            print(f"[空调] 🔛 空调已开启")
+
         elif command == "off":
-            result = self.turn_off()
+            self.power = "off"
+            changed = True
+            print(f"[空调] 🔴 空调已关闭")
+
         elif command == "set_temperature":
-            temp = params.get("temperature", 24)
-            result = self.set_temperature(temp)
+            temp = params.get("temperature")
+            if temp and 16 <= temp <= 30:
+                self.temperature = temp
+                changed = True
+                print(f"[空调] 🌡️ 温度: {self.temperature}°C")
+
         elif command == "set_mode":
-            mode = params.get("mode", "cool")
-            result = self.set_mode(mode)
+            mode = params.get("mode")
+            if mode in ["cool", "heat", "fan", "auto"]:
+                self.mode = mode
+                changed = True
+                mode_names = {"cool": "制冷", "heat": "制热", "fan": "送风", "auto": "自动"}
+                print(f"[空调] 🔄 模式: {mode_names.get(self.mode)}")
+
         elif command == "set_fan_speed":
-            speed = params.get("speed", "auto")
-            result = self.set_fan_speed(speed)
-        elif command == "get_status":
-            result = self.send_status()
+            speed = params.get("speed")
+            if speed in ["auto", "low", "medium", "high"]:
+                self.fan_speed = speed
+                changed = True
+                print(f"[空调] 💨 风速: {self.fan_speed}")
 
-        # 发送命令响应
-        response = {
-            "device_id": self.device_id,
-            "command": command,
-            "result": result,
-            "timestamp": time.time()
-        }
-        self.mqtt_client.publish(TOPICS["device_command_response"], json.dumps(response))
-
-        # 发送状态更新
+        # 无论是否改变，都上报当前状态（确保UI同步）
         self.send_status()
 
-    def handle_response(self, payload: Dict):
-        """处理响应消息"""
-        if payload.get("success"):
-            print(f"[空调] ✅ 注册成功: {payload.get('message')}")
-        else:
-            print(f"[空调] ❌ 注册失败: {payload.get('message')}")
+    def send_status(self):
+        """上报设备状态到云端"""
+        status = "online" if self.power == "on" else "standby"
 
-    def turn_on(self) -> bool:
-        """开启空调"""
-        self.is_on = True
-        print(f"[空调] 🔛 空调已开启")
-        return True
-
-    def turn_off(self) -> bool:
-        """关闭空调"""
-        self.is_on = False
-        print(f"[空调] 🔴 空调已关闭")
-        return True
-
-    def set_temperature(self, temperature: int) -> bool:
-        """设置温度"""
-        if 16 <= temperature <= 30:
-            self.target_temperature = temperature
-            if self.is_on:
-                self.temperature = temperature
-            print(f"[空调] 🌡️ 温度设置为: {temperature}°C")
-            return True
-        else:
-            print(f"[空调] ❌ 无效温度: {temperature} (有效范围: 16-30)")
-            return False
-
-    def set_mode(self, mode: str) -> bool:
-        """设置模式"""
-        valid_modes = ["cool", "heat", "fan", "auto"]
-        if mode in valid_modes:
-            self.mode = mode
-            print(f"[空调] 🔄 模式设置为: {mode}")
-            return True
-        else:
-            print(f"[空调] ❌ 无效模式: {mode}")
-            return False
-
-    def set_fan_speed(self, speed: str) -> bool:
-        """设置风速"""
-        valid_speeds = ["auto", "low", "medium", "high"]
-        if speed in valid_speeds:
-            self.fan_speed = speed
-            print(f"[空调] 💨 风速设置为: {speed}")
-            return True
-        else:
-            print(f"[空调] ❌ 无效风速: {speed}")
-            return False
-
-    def send_status(self) -> bool:
-        """发送设备状态"""
-        status = {
+        status_msg = {
             "device_id": self.device_id,
-            "status": "online" if self.is_on else "standby",
+            "status": status,
             "properties": {
-                "power": "on" if self.is_on else "off",
-                "temperature": self.target_temperature if self.is_on else self.temperature,
+                "power": self.power,
+                "temperature": self.temperature,
                 "current_temperature": self.temperature,
                 "mode": self.mode,
                 "fan_speed": self.fan_speed
@@ -197,58 +148,45 @@ class AirConditioner:
             "timestamp": time.time()
         }
 
-        # 添加安全签名
+        # 添加签名
         self.seq_num += 1
         signature = CryptoUtils.sign_message(
             self.seq_num,
-            status["timestamp"],
-            status,
+            status_msg["timestamp"],
+            status_msg,
             self.secret_key
         )
-        status["seq_num"] = self.seq_num
-        status["signature"] = signature
+        status_msg["seq_num"] = self.seq_num
+        status_msg["signature"] = signature
 
-        self.mqtt_client.publish(TOPICS["device_status"], json.dumps(status))
-        print(f"[空调] 📊 发送状态: {'开启' if self.is_on else '关闭'} | {self.target_temperature}°C | {self.mode}模式")
-        return True
+        # 发布到云端
+        self.mqtt_client.publish(TOPICS["device_status"], json.dumps(status_msg))
 
-    def _periodic_status_update(self):
-        """定期发送状态更新"""
-        while self.running:
-            time.sleep(30)  # 每30秒发送一次
-            if self.mqtt_client.is_connected():
-                self.send_status()
+        # 打印状态
+        mode_names = {"cool": "制冷", "heat": "制热", "fan": "送风", "auto": "自动"}
+        power_text = "🟢 开启" if self.power == "on" else "🔴 关闭"
+        print(f"[空调] 📤 上报: {power_text} | 🌡️ {self.temperature}°C | {mode_names.get(self.mode)}")
 
     def start(self):
-        """启动设备"""
-        print(f"[空调] 🚀 启动空调设备: {self.device_id}")
-        print(f"[空调] MQTT Broker: {BROKER_HOST}:{BROKER_PORT}")
+        print(f"\n[空调] 🚀 启动设备: {self.device_id}")
+        print(f"[空调] Broker: {BROKER_HOST}:{BROKER_PORT}\n")
 
         try:
             self.mqtt_client.connect(BROKER_HOST, BROKER_PORT, 60)
             self.mqtt_client.loop_start()
-            self.status_thread.start()
+            print(f"[空调] ✅ 运行中，等待命令...\n")
 
-            print(f"[空调] ✅ 空调运行中... (按 Ctrl+C 停止)")
-
-            # 保持运行
-            while True:
+            while self.running:
                 time.sleep(1)
 
         except KeyboardInterrupt:
-            print(f"\n[空调] 🛑 正在关闭...")
-        except Exception as e:
-            print(f"[空调] ❌ 连接失败: {e}")
-            print(f"[空调] 请确保 MQTT Broker 正在运行")
+            print(f"\n[空调] 🛑 关闭")
         finally:
             self.running = False
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
-            print(f"[空调] 👋 已关闭")
 
 
 if __name__ == "__main__":
-    # 使用配置中的设备ID和密钥
-    device_id = DEVICE_IDS["air_conditioner"]
-    ac = AirConditioner(device_id, SECRET_KEY)
+    ac = AirConditioner("ac_001", SECRET_KEY)
     ac.start()
