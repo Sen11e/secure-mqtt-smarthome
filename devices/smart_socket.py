@@ -1,31 +1,28 @@
 # ============================================
-# devices/smart_socket.py - 智能插座
+# devices/smart_socket.py
 # ============================================
 
 import json
 import time
 import sys
 import os
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import paho.mqtt.client as mqtt
-from config import BROKER_HOST, BROKER_PORT, TOPICS, SECRET_KEY, DEVICE_IDS
+from config import BROKER_HOST, BROKER_PORT, TOPICS, SECRET_KEY
 from crypto_utils import CryptoUtils
 
 
 class SmartSocket:
-    """智能插座设备"""
-
     def __init__(self, device_id: str, secret_key: bytes):
         self.device_id = device_id
         self.secret_key = secret_key
 
-        # 设备状态
-        self.is_on = False
-        self.power_mode = "normal"  # normal, eco, timer
-        self.power_consumption = 0  # 当前功耗 (W)
+        self.power = "off"
+        self.power_mode = "normal"
 
-        self.mqtt_client = mqtt.Client()
+        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.seq_num = 0
         self.running = True
 
@@ -35,13 +32,18 @@ class SmartSocket:
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
 
-    def on_connect(self, client, userdata, flags, rc):
+    def on_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
+            print(f"\n{'=' * 50}")
             print(f"[插座] ✅ 已连接到MQTT Broker")
             command_topic = f"device/{self.device_id}/command"
             self.mqtt_client.subscribe(command_topic)
             print(f"[插座] 已订阅: {command_topic}")
+            print(f"{'=' * 50}\n")
+
             self.register_device()
+            time.sleep(1)
+            self.send_status()
         else:
             print(f"[插座] ❌ 连接失败")
 
@@ -58,61 +60,81 @@ class SmartSocket:
     def on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode())
+            print(f"\n[插座] 📨 收到: {json.dumps(payload, ensure_ascii=False)}")
+
+            command = None
+            params = {}
+
             if "command" in payload:
-                self.handle_command(payload)
+                command = payload["command"]
+                params = payload.get("params", {})
+            elif "params" in payload and isinstance(payload["params"], dict):
+                if "command" in payload["params"]:
+                    command = payload["params"]["command"]
+                    params = payload["params"].get("params", {})
+
+            if command:
+                self.execute_command(command, params)
+
         except Exception as e:
             print(f"[插座] ❌ 异常: {e}")
 
-    def handle_command(self, payload):
-        command = payload.get("command")
-        params = payload.get("params", {})
+    def execute_command(self, command, params):
+        print(f"\n[插座] 🎮 执行: {command} {params}")
 
-        print(f"[插座] 🎮 收到命令: {command}")
+        changed = False
 
         if command == "on":
-            self.is_on = True
-            self.power_consumption = 50 if self.power_mode == "normal" else 20
-            print(f"[插座] 🔌 插座已开启 (功耗: {self.power_consumption}W)")
+            self.power = "on"
+            changed = True
+            print(f"[插座] 🔌 已开启")
+
         elif command == "off":
-            self.is_on = False
-            self.power_consumption = 0
-            print(f"[插座] 🔴 插座已关闭")
+            self.power = "off"
+            changed = True
+            print(f"[插座] 🔴 已关闭")
+
         elif command == "set_power_mode":
-            mode = params.get("mode", "normal")
-            if mode in ["normal", "eco", "timer"]:
+            mode = params.get("mode")
+            if mode in ["normal", "eco"]:
                 self.power_mode = mode
-                print(f"[插座] ⚡ 功率模式: {mode}")
+                changed = True
+                print(f"[插座] ⚡ 模式: {mode}")
 
         self.send_status()
 
     def send_status(self):
-        status = {
+        status = "online" if self.power == "on" else "standby"
+
+        status_msg = {
             "device_id": self.device_id,
-            "status": "online" if self.is_on else "standby",
+            "status": status,
             "properties": {
-                "power": "on" if self.is_on else "off",
-                "power_mode": self.power_mode,
-                "power_consumption": self.power_consumption
+                "power": self.power,
+                "power_mode": self.power_mode
             },
             "timestamp": time.time()
         }
 
         self.seq_num += 1
         signature = CryptoUtils.sign_message(
-            self.seq_num, status["timestamp"], status, self.secret_key
+            self.seq_num, status_msg["timestamp"], status_msg, self.secret_key
         )
-        status["seq_num"] = self.seq_num
-        status["signature"] = signature
+        status_msg["seq_num"] = self.seq_num
+        status_msg["signature"] = signature
 
-        self.mqtt_client.publish(TOPICS["device_status"], json.dumps(status))
-        print(f"[插座] 📊 状态更新")
+        self.mqtt_client.publish(TOPICS["device_status"], json.dumps(status_msg))
+
+        power_text = "🟢 开启" if self.power == "on" else "🔴 关闭"
+        print(f"[插座] 📤 上报: {power_text} | 模式: {self.power_mode}")
 
     def start(self):
-        print(f"[插座] 🚀 启动智能插座: {self.device_id}")
+        print(f"\n[插座] 🚀 启动设备: {self.device_id}\n")
+
         try:
             self.mqtt_client.connect(BROKER_HOST, BROKER_PORT, 60)
             self.mqtt_client.loop_start()
-            print(f"[插座] ✅ 插座运行中...")
+            print(f"[插座] ✅ 运行中...\n")
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
@@ -120,9 +142,9 @@ class SmartSocket:
         finally:
             self.running = False
             self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
 
 
 if __name__ == "__main__":
-    device_id = DEVICE_IDS["smart_socket"]
-    ss = SmartSocket(device_id, SECRET_KEY)
+    ss = SmartSocket("ss_001", SECRET_KEY)
     ss.start()
